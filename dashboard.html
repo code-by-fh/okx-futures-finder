@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OKX Scanner</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101820;color:#e6edf3}body{max-width:1200px;margin:auto;padding:28px}h1{margin-bottom:4px}small,.muted{color:#a6b5c4}header{display:flex;justify-content:space-between;align-items:center;gap:20px}.badge{padding:10px 16px;border-radius:24px;background:#264138}.bad{background:#71352c}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:28px 0}.card,section{background:#1b2632;border:1px solid #304051;border-radius:14px;padding:20px}.card strong{display:block;margin-top:12px;font-size:24px}section{margin:20px 0}input{background:#101820;border:1px solid #526375;color:inherit;padding:10px;border-radius:8px;width:min(300px,90%)}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;padding:13px 12px;border-bottom:1px solid #304051}th{color:#a6b5c4;font-weight:500}a{color:#78d9c1;text-decoration:none}a:hover{text-decoration:underline}#error{overflow-wrap:anywhere;color:#f5b894}.bull{color:#78d9c1}.bear{color:#f5b894}
+.coin-scroll{max-height:65vh;overflow:auto}thead th{position:sticky;top:0;background:#1b2632;z-index:1}.num{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover{background:#263645}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:20px 0}th button{background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:4px 0}th button:hover{color:#78d9c1}button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid #78d9c1;outline-offset:4px}.empty{text-align:center;color:#a6b5c4;padding:28px}@media(max-width:600px){body{padding:14px}section{padding:14px}th,td{padding:12px 8px}}
+</style>
+<header><div><h1>OKX Scanner</h1><small>Liquidität · Sweeps · Strukturbrüche</small></div><span id="status" class="badge">Verbinde …</span></header>
+<div class="cards"><div class="card">Beobachtete Coins<strong id="count">–</strong></div><div class="card">Letzter Scan<strong id="scan">–</strong></div><div class="card">Wartende Signale<strong id="pending">–</strong></div><div class="card">Fehler im letzten Scan<strong id="errors">–</strong></div></div>
+<p id="error"></p>
+<section><h2>Aktivste Coins · letzte 5 Minuten</h2><p id="ranking" class="muted">Rangfolge wird geladen …</p><div class="toolbar"><label>Coin suchen <input id="search" placeholder="BTC, SOL, …" type="search"></label><span id="visible" class="muted" aria-live="polite"></span></div><div class="coin-scroll"><table aria-label="Coin-Rangfolge nach Handelsaktivität"><thead><tr><th scope="col" class="num" data-sort="rank" aria-sort="none"><button type="button">Rang</button></th><th scope="col" data-sort="symbol" aria-sort="none"><button type="button">Coin / Chart</button></th><th scope="col" class="num" data-sort="turnover_5m" aria-sort="descending"><button type="button">Umsatz letzte 5 Min. (USDT) ↓</button></th><th scope="col" class="num" data-sort="spread" aria-sort="none"><button type="button">Spread</button></th></tr></thead><tbody id="pairs"></tbody></table></div></section>
+<section><h2>Letzte erkannte Signale</h2><p class="muted">Bis zu 100 Treffer. Neue Signale werden gesammelt versendet.</p><div class="scroll"><table><thead><tr><th>Zeit (UTC)</th><th>Coin / Chart</th><th>Signal</th><th>Schlusskurs</th></tr></thead><tbody id="signals"></tbody></table></div></section>
+<p id="traffic" class="muted"></p><small>Automatische Aktualisierung alle 5 Sekunden. Der Scanner muss weiterlaufen.</small>
+<script>
+let current=[];
+let sortKey='turnover_5m', sortDirection=-1;
+const el=id=>document.getElementById(id);
+function cell(row,value){const td=document.createElement('td');td.textContent=value;row.append(td);return td;}
+function coin(row,symbol){const td=cell(row,'');const a=document.createElement('a');a.textContent=symbol;a.href='https://www.okx.com/trade-swap/'+encodeURIComponent(symbol.toLowerCase());a.target='_blank';a.rel='noopener noreferrer';td.append(a);}
+function formatVolume(value){return new Intl.NumberFormat('de-DE',{notation:value>=1000000?'compact':'standard',maximumFractionDigits:value>=1000000?2:0}).format(value);}
+function renderPairs(){
+    const query=el('search').value.trim().toUpperCase();
+    const rows=current.map((p,i)=>({...p,rank:i+1})).filter(p=>p.symbol.toUpperCase().includes(query));
+    rows.sort((a,b)=>sortDirection*(sortKey==='symbol'?a.symbol.localeCompare(b.symbol):(a[sortKey]||0)-(b[sortKey]||0))||a.rank-b.rank);
+    el('visible').textContent=rows.length+' von '+current.length+' Coins';
+    const fragment=document.createDocumentFragment();
+    for(const p of rows){
+        const tr=document.createElement('tr');cell(tr,p.rank).className='num';coin(tr,p.symbol);
+        const volume=cell(tr,formatVolume(p.turnover_5m||0));volume.className='num';volume.title=(p.turnover_5m||0).toLocaleString('de-DE',{maximumFractionDigits:2})+' USDT';
+        cell(tr,p.spread.toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+' %').className='num';fragment.append(tr);
+    }
+    if(!rows.length){const tr=document.createElement('tr');const td=cell(tr,current.length?'Keine Coins passen zur Suche.':'Noch keine aktuellen Coin-Daten vorhanden.');td.colSpan=4;td.className='empty';fragment.append(tr);}
+    el('pairs').replaceChildren(fragment);
+}
+document.querySelectorAll('[data-sort]').forEach(th=>{
+    const button=th.querySelector('button');button.dataset.label=button.textContent.replace(/ [↑↓]$/,'');
+    button.addEventListener('click',()=>{
+        if(sortKey===th.dataset.sort){sortDirection*=-1;}else{sortKey=th.dataset.sort;sortDirection=sortKey==='turnover_5m'?-1:1;}
+        document.querySelectorAll('[data-sort]').forEach(column=>{const active=column.dataset.sort===sortKey;column.setAttribute('aria-sort',active?(sortDirection===1?'ascending':'descending'):'none');const b=column.querySelector('button');b.textContent=b.dataset.label+(active?(sortDirection===1?' ↑':' ↓'):'');});renderPairs();
+    });
+});
+el('search').addEventListener('input',renderPairs);
+async function refresh(){try{const response=await fetch('/api/status',{cache:'no-store',signal:AbortSignal.timeout(4000)});if(!response.ok)throw Error('HTTP '+response.status);const d=await response.json();current=d.pairs;renderPairs();el('ranking').textContent=d.volume_end?'Fünf abgeschlossene Minuten bis '+d.volume_end+' · '+d.candidates+' Coins geprüft · '+(d.ranking_errors||0)+' Umsatz-Abfragen fehlgeschlagen':'Erste Umsatzmessung läuft …';el('traffic').textContent='Seit Start: '+(d.network_requests||0)+' API-Abfragen · '+((d.network_bytes||0)/1000000).toFixed(2)+' MB empfangene JSON-Daten (ohne HTTP/TLS) · letzter Durchlauf: '+(d.cycle_seconds||0)+' Sekunden';el('count').textContent=current.length;el('scan').textContent=d.last_scan?new Date(d.last_scan*1000).toLocaleTimeString('de-DE'):'Startet …';el('pending').textContent=d.pending;el('errors').textContent=d.errors;el('status').textContent=d.outage?'Störung':d.last_success?(d.errors?'Läuft mit Fehlern':'Läuft'):'Erster Scan läuft';el('status').className='badge'+(d.outage||d.errors?' bad':'');el('error').textContent=d.last_error?'Letzte Fehlermeldung: '+d.last_error:'';el('signals').replaceChildren();for(const s of d.signals){const tr=document.createElement('tr');cell(tr,s.time_utc);coin(tr,s.symbol);const kind=cell(tr,s.event.replaceAll('_',' '));kind.className=s.event.startsWith('BULL')?'bull':'bear';cell(tr,s.close);el('signals').append(tr);}}catch(e){el('status').textContent='Scanner nicht erreichbar';el('status').className='badge bad';}}
+refresh();setInterval(refresh,5000);
+</script></html>

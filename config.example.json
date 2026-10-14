@@ -1,0 +1,38 @@
+{
+  "okx_api_base": "https://eea.okx.com",
+  "pushover": {
+    "app_token": "HIER_DEIN_APPLICATION_API_TOKEN",
+    "user_key": "HIER_DEIN_USER_KEY"
+  },
+  "selection": {
+    "max_pairs": 400,
+    "min_24h_usdt": 0,
+    "max_spread_pct": 0.15,
+    "min_5m_usdt": 0
+  },
+  "strategy": {
+    "timeframe": "5m",
+    "pivot_left": 3,
+    "pivot_right": 3,
+    "bos_window_bars": 8,
+    "max_pivot_age_bars": 50,
+    "min_sweep_depth_pct": 0.02,
+    "min_bos_break_pct": 0.0,
+    "notify_sweeps": true,
+    "notify_bos": true
+  },
+  "dashboard": {
+    "enabled": true,
+    "port": 8765
+  },
+  "notifications": {
+    "summary_seconds": 120,
+    "outage_seconds": 180
+  },
+  "runtime": {
+    "poll_seconds": 30,
+    "refresh_pairs_minutes": 1,
+    "delay_between_pairs_seconds": 0.15,
+    "max_signal_age_minutes": 7
+  }
+}

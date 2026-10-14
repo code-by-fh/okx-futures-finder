@@ -1,0 +1,74 @@
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+from urllib.request import urlopen
+
+from dashboard import Dashboard, HealthMonitor
+from scanner import flush_summary
+
+
+class DashboardTests(unittest.TestCase):
+    def test_local_status_does_not_expose_config(self):
+        root = Path(__file__).parent
+        dashboard = Dashboard(root, 0)
+        dashboard.start()
+        try:
+            base = f"http://127.0.0.1:{dashboard.server.server_port}"
+            with urlopen(base + "/api/status") as response:
+                data = json.load(response)
+            self.assertIn("pairs", data)
+            self.assertNotIn("pushover", data)
+            with urlopen(base) as response:
+                self.assertIn(b"Umsatz letzte 5 Min. (USDT)", response.read())
+        finally:
+            dashboard.close()
+
+    def test_outage_once_and_recovery(self):
+        dashboard = Dashboard(Path('.'))
+        dashboard.update(started=100)
+        messages = []
+        monitor = HealthMonitor(dashboard, 180, lambda *args: messages.append(args))
+        monitor.check(279)
+        self.assertEqual(messages, [])
+        monitor.check(280)
+        monitor.check(300)
+        self.assertEqual(len(messages), 1)
+        dashboard.update(last_success=301)
+        monitor.check(302)
+        monitor.check(303)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("Entwarnung", messages[-1][0])
+
+    def test_failed_outage_push_retries(self):
+        dashboard = Dashboard(Path('.'))
+        dashboard.update(started=100)
+        with patch('scanner.push_notification', side_effect=[RuntimeError('offline'), None]) as push:
+            monitor = HealthMonitor(dashboard, 180, push)
+            monitor.check(280)
+            self.assertFalse(monitor.reported)
+            monitor.check(300)
+            self.assertEqual(push.call_count, 1)
+            monitor.check(340)
+            self.assertTrue(monitor.reported)
+
+    def test_summary_keeps_unsent_chunk_after_failure(self):
+        events = [dict(symbol='BTC-USDT-SWAP', kind='BULL_BOS', close=100,
+                       time='2026-10-14 12:00 UTC',
+                       url='https://www.okx.com/trade-swap/btc-usdt-swap') for _ in range(15)]
+        state = dict(pending=events, sent=[], last_seen={})
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'state.json'
+            with patch('scanner.STATE_FILE', path), patch('scanner.push_notification',
+                    side_effect=[None, RuntimeError('offline')]) as push:
+                with self.assertRaises(RuntimeError):
+                    flush_summary({}, state)
+                self.assertGreater(len(state['pending']), 0)
+                self.assertLess(len(state['pending']), 15)
+                self.assertEqual(json.loads(path.read_text())['pending'], state['pending'])
+                self.assertLessEqual(len(push.call_args_list[0].args[2].encode('utf-8')), 900)
+
+
+if __name__ == '__main__':
+    unittest.main()
