@@ -1,5 +1,4 @@
 """Local, read-only scanner dashboard and outage notifications (stdlib only)."""
-import csv
 import json
 import threading
 import time
@@ -7,26 +6,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Dashboard:
-    def __init__(self, root, port=8765):
+    def __init__(self, root, port=8765, host='127.0.0.1'):
         self.root, self.port = root, port
+        self.host = host
         self.lock = threading.Lock()
         self.data = dict(started=time.time(), last_success=None, last_scan=None,
-                         last_error="", errors=0, pending=0, pairs=[], outage=False)
+                         last_error="", errors=0, pending=0, pairs=[], outage=False,
+                         phase="Startet", processed=0, total=0, error_log=[])
         self.server = None
 
     def update(self, **values):
         with self.lock:
             self.data.update(values)
 
+    def report_error(self, source, message, symbol=""):
+        event = dict(time=time.time(), source=source, message=str(message)[:600], symbol=symbol)
+        with self.lock:
+            self.data["last_error"] = f"{symbol + ': ' if symbol else ''}{event['message']}"
+            self.data["error_log"] = (self.data["error_log"] + [event])[-50:]
+
     def snapshot(self):
         with self.lock:
             result = dict(self.data)
-        result["signals"] = []
-        try:
-            with (self.root / "signals.csv").open(encoding="utf-8", newline="") as file:
-                result["signals"] = list(csv.DictReader(file))[-100:][::-1]
-        except (OSError, csv.Error):
-            pass
+        result["server_time"] = time.time()
         return result
 
     def start(self):
@@ -35,12 +37,20 @@ class Dashboard:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
-                if path == "/api/status":
+                if path == '/healthz':
+                    body = b'{"status":"ok"}'
+                    content_type = 'application/json; charset=utf-8'
+                elif path == "/api/status":
                     body = json.dumps(dashboard.snapshot()).encode("utf-8")
                     content_type = "application/json; charset=utf-8"
-                elif path == "/":
-                    body = (dashboard.root / "dashboard.html").read_bytes()
-                    content_type = "text/html; charset=utf-8"
+                elif path in ("/", "/dashboard.css", "/dashboard.js"):
+                    name = "dashboard.html" if path == "/" else path[1:]
+                    try:
+                        body = (dashboard.root / name).read_bytes()
+                    except OSError:
+                        self.send_error(404)
+                        return
+                    content_type = {"/": "text/html", "/dashboard.css": "text/css", "/dashboard.js": "text/javascript"}[path] + "; charset=utf-8"
                 else:
                     self.send_error(404)
                     return
@@ -54,7 +64,7 @@ class Dashboard:
             def log_message(self, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self.server = ThreadingHTTPServer((self.host, self.port), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         print(f"Browser-Dashboard: http://127.0.0.1:{self.server.server_port}")
 
@@ -88,7 +98,7 @@ class HealthMonitor:
                 self.notify("OKX Scanner: Entwarnung", "Der Scanner erhaelt wieder Marktdaten.")
             self.reported = outage
         except Exception as err:
-            self.dashboard.update(last_error=f"Stoerungsmeldung nicht zugestellt: {err}")
+            self.dashboard.report_error("Störungsmeldung", str(err))
             self.next_attempt = now + 60
 
     def run(self, stop):

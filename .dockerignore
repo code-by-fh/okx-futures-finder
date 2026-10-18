@@ -1,0 +1,11 @@
+# Allowlist: local credentials, runtime history, .git, tests and backups never enter the build context.
+**
+!Dockerfile
+!scanner.py
+!dashboard.py
+!discovery.py
+!market.py
+!dashboard.html
+!dashboard.css
+!dashboard.js
+!config.example.json

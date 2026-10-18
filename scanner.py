@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OKX 5m liquidity-sweep / structure-break scanner with Pushover notifications.
+"""OKX Futures-Finder: rank USDT perpetuals by completed one-minute candle ranges.
 
 Only public market-data endpoints. No API keys from OKX, trading, or order execution.
 Compatible with Python 3.10+ and its standard library.
@@ -10,10 +10,11 @@ from __future__ import annotations
 import argparse
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -23,6 +24,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from dashboard import Dashboard, HealthMonitor
+from market import window_metrics, RankingHistory
+from discovery import discover, MARKETS
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
@@ -61,6 +64,18 @@ class Pair:
     spread_pct: float
     turnover_5m_usdt: float = 0.0
     volume_end_ts: int = 0
+    price: float | None = None
+    change_5m_pct: float | None = None
+    range_5m_pct: float | None = None
+    trend: tuple[float, ...] = ()
+    volatility_1m_pct: float | None = None
+    range_1m_pct: float | None = None
+    change_1m_pct: float | None = None
+    profiles: dict = field(default_factory=dict)
+    market: str = 'eea_xperp'
+    quote_ccy: str = 'USD'
+    chart_url: str = ''
+    turnover_60m: float | None = None
 
 
 def utc_time(ts_ms: int) -> str:
@@ -251,98 +266,67 @@ def recent_turnover(rows: list, end_ts: int) -> float | None:
     expected = range(end_ts - 300_000, end_ts, 60_000)
     if not all(ts in volumes for ts in expected):
         return None
-    return sum(volumes[ts] for ts in expected)
+    total = sum(volumes[ts] for ts in expected)
+    return total if math.isfinite(total) else None
 
 
 def find_pairs(cfg: dict, dashboard: Dashboard | None = None) -> list[Pair]:
-    live_rows = okx_api(cfg, "/api/v5/public/instruments", instType="SWAP")
-    live = {r.get("instId") for r in live_rows if r.get("state") == "live"}
-    tickers = okx_api(cfg, "/api/v5/market/tickers", instType="SWAP")
-    selection = cfg["selection"]
-    candidates: list[Pair] = []
-    for item in tickers:
-        symbol = item.get("instId", "")
-        if not symbol.endswith("-USDT-SWAP") or symbol not in live:
-            continue
-        try:
-            last = float(item["last"])
-            bid, ask = float(item["bidPx"]), float(item["askPx"])
-            vol_base = float(item["volCcy24h"])
-        except (ValueError, KeyError, TypeError):
-            continue
-        if min(last, bid, ask, vol_base) <= 0 or bid > ask:
-            continue
-        # For OKX derivatives, volCcy24h is in base currency (e.g., BTC).
-        # Approximate USDT turnover = base volume times most recent price.
-        turnover_usdt = vol_base * last
-        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
-        if turnover_usdt < float(selection.get("min_24h_usdt", 0)):
-            continue
-        if spread_pct > float(selection["max_spread_pct"]):
-            continue
-        candidates.append(Pair(symbol, turnover_usdt, spread_pct))
-    # Do not preselect by 24h turnover: newly active coins must also be measured.
-    end_ts = int((time.time() - 3) // 60) * 60_000
-    ranked = []
-    failures = 0
-
-    def measure(pair):
-        rows = okx_api(cfg, "/api/v5/market/candles", instId=pair.symbol, bar="1m", limit="8")
-        volume = recent_turnover(rows, end_ts)
-        if volume is None:
-            raise RuntimeError("Unvollstaendige oder veraltete 1m-Umsatzdaten")
-        if volume <= 0 or volume < float(selection.get("min_5m_usdt", 0)):
-            return None
-        return Pair(pair.symbol, pair.turnover_usdt, pair.spread_pct, volume, end_ts)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(measure, pair): pair.symbol for pair in candidates}
-        for future in as_completed(futures):
-            try:
-                pair = future.result()
-                if pair:
-                    ranked.append(pair)
-                    if dashboard:
-                        dashboard.update(last_success=time.time())
-            except (RuntimeError, ValueError, KeyError, TypeError) as err:
-                failures += 1
-                print(f"  UMSATZ-FEHLER {futures[future]}: {err}", file=sys.stderr)
-    if dashboard:
-        dashboard.update(ranking_errors=failures, ranking_time=time.time(),
-                         volume_end=utc_time(end_ts), candidates=len(candidates))
-    if candidates and failures == len(candidates):
-        raise RuntimeError("Keine aktuellen 5m-Umsatzdaten erhalten")
-    ranked.sort(key=lambda pair: pair.turnover_5m_usdt, reverse=True)
-    return ranked[:int(selection["max_pairs"])]
+    return [Pair(**record) for record in discover(cfg, okx_api, dashboard)]
 
 
 def read_config() -> dict:
-    if not CONFIG_FILE.exists():
-        raise RuntimeError("config.json fehlt. Bitte config.example.json nach config.json kopieren und ausfüllen.")
-    cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    config_path = Path(os.environ.get('OKX_CONFIG_FILE', str(CONFIG_FILE)))
+    if not config_path.exists():
+        raise RuntimeError("config.json fehlt. config.example.json nach config.json kopieren.")
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
     cfg.setdefault("dashboard", {"enabled": True, "port": 8765})
-    cfg.setdefault("notifications", {"summary_seconds": 120, "outage_seconds": 180})
-    if float(cfg["notifications"].get("summary_seconds", 120)) < 0:
-        raise ValueError("notifications.summary_seconds muss >= 0 sein")
-    if float(cfg["notifications"].get("outage_seconds", 180)) < 10:
-        raise ValueError("notifications.outage_seconds muss >= 10 sein")
-    if cfg.get("strategy", {}).get("timeframe") not in ("1m", "3m", "5m", "15m"):
-        raise ValueError("strategy.timeframe muss 1m, 3m, 5m oder 15m sein")
-    for key in ("pivot_left", "pivot_right", "bos_window_bars", "max_pivot_age_bars"):
-        if int(cfg["strategy"][key]) < 1:
-            raise ValueError(f"strategy.{key} muss >= 1 sein")
+    cfg.setdefault("runtime", {})
+    cfg.setdefault("selection", {})
+    overrides = {
+        'OKX_API_BASE': (None, 'okx_api_base', str),
+        'OKX_MARKET': (None, 'market', str),
+        'DASHBOARD_HOST': ('dashboard', 'host', str),
+        'PORT': ('dashboard', 'port', int),
+        'MAX_PAIRS': ('selection', 'max_pairs', int),
+        'MIN_5M_TURNOVER': ('selection', 'min_5m_usdt', float),
+        'MIN_24H_TURNOVER': ('selection', 'min_24h_usdt', float),
+        'MAX_SPREAD_PCT': ('selection', 'max_spread_pct', float),
+        'REFRESH_MINUTES': ('runtime', 'refresh_pairs_minutes', float),
+    }
+    for name, (section, key, convert) in overrides.items():
+        if name in os.environ:
+            try:
+                target = cfg[section] if section else cfg
+                target[key] = convert(os.environ[name].strip())
+            except (ValueError, TypeError) as err:
+                raise ValueError(f'Ungueltiger Wert fuer {name}') from err
+    cfg['dashboard'].setdefault('host', '127.0.0.1')
+    port = cfg['dashboard'].get('port', 8765)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError('dashboard.port muss zwischen 1 und 65535 liegen')
+    if not cfg['dashboard']['host']:
+        raise ValueError('dashboard.host darf nicht leer sein')
+    cfg.setdefault("market", "eea_xperp")
+    if cfg["market"] not in MARKETS:
+        raise ValueError("market muss eea_xperp oder usdt_swap sein")
+    cfg["runtime"].setdefault("refresh_pairs_minutes", 1)
+    for key, default in {"max_pairs": 400, "min_24h_usdt": 0,
+                         "min_5m_usdt": 0, "max_spread_pct": .15}.items():
+        cfg["selection"].setdefault(key, default)
     if not cfg.get("okx_api_base", "").startswith("https://"):
         raise ValueError("Bitte eine HTTPS-OKX-API-Domain angeben")
-    if int(cfg["selection"]["max_pairs"]) < 1:
-        raise ValueError("selection.max_pairs muss >= 1 sein")
-    if float(cfg["runtime"]["refresh_pairs_minutes"]) <= 0:
-        raise ValueError("runtime.refresh_pairs_minutes muss > 0 sein")
+    count = cfg["selection"]["max_pairs"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("selection.max_pairs muss eine ganze Zahl >= 1 sein")
+    refresh = float(cfg["runtime"]["refresh_pairs_minutes"])
+    if not math.isfinite(refresh) or refresh < 1:
+        raise ValueError("runtime.refresh_pairs_minutes muss >= 1 sein")
     for key in ("min_24h_usdt", "min_5m_usdt", "max_spread_pct"):
-        value = float(cfg["selection"].get(key, 0))
+        value = float(cfg["selection"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"selection.{key} muss eine endliche Zahl >= 0 sein")
-    if float(cfg["runtime"]["poll_seconds"]) < 10:
-        raise ValueError("runtime.poll_seconds muss >= 10 sein")
+    # Old local configurations remain readable, but the finder never runs strategies.
+    cfg["runtime"]["signals_enabled"] = False
     return cfg
 
 
@@ -380,8 +364,11 @@ def chart_link(symbol: str) -> str:
 
 def print_pairs(pairs: list[Pair]) -> None:
     for pair in pairs:
-        print(f"  {pair.symbol:<20} {pair.turnover_5m_usdt:,.0f} USDT/5m"
-              f"  Spread {pair.spread_pct:.3f}%  {chart_link(pair.symbol)}")
+        volatility = pair.volatility_1m_pct
+        value = f"{volatility:.3f}%" if volatility is not None else "n/a"
+        print(f"  {pair.symbol:<22} 1m-ATR: {value:>8}"
+              f"  {pair.turnover_5m_usdt:,.0f} {pair.quote_ccy}/5m"
+              f"  Spread {pair.spread_pct:.3f}%  {(pair.chart_url or chart_link(pair.symbol))}")
 
 
 def push_notification(cfg: dict, title: str, message: str, url: str = "") -> None:
@@ -446,7 +433,7 @@ def get_bars(cfg: dict, symbol: str) -> list[Candle]:
 
 
 def process_symbol(cfg: dict, pair: Pair, state: dict, batch: bool = False,
-                   bars: list[Candle] | None = None) -> tuple[int, int]:
+                   bars: list[Candle] | None = None, dashboard: Dashboard | None = None) -> tuple[int, int]:
     bars = get_bars(cfg, pair.symbol) if bars is None else bars
     if len(bars) < 30:
         return 0, 0
@@ -482,7 +469,7 @@ def process_symbol(cfg: dict, pair: Pair, state: dict, batch: bool = False,
                 state.setdefault("pending", []).append({
                     "symbol": pair.symbol, "kind": signal.kind,
                     "time": utc_time(signal.ts), "close": signal.close,
-                    "url": chart_link(pair.symbol)})
+                    "url": (pair.chart_url or chart_link(pair.symbol))})
             else:
                 push_signal(cfg, pair.symbol, signal)
             log_signal(pair.symbol, signal)
@@ -495,6 +482,8 @@ def process_symbol(cfg: dict, pair: Pair, state: dict, batch: bool = False,
         except Exception as err:
             errors += 1
             print(f"  PUSH-FEHLER {pair.symbol} {signal.kind}: {err}", file=sys.stderr)
+            if dashboard:
+                dashboard.report_error("Signalversand", str(err), pair.symbol)
     # When sending failed, keep prior timestamp so recent signals get another try.
     if errors == 0:
         state["last_seen"][pair.symbol] = last_ts
@@ -522,145 +511,70 @@ def flush_summary(cfg: dict, state: dict) -> int:
 
 
 def print_health_check(cfg: dict) -> None:
-    print("Pruefe oeffentliche OKX API ...")
+    print("Pruefe oeffentliche OKX-Daten fuer den Futures-Finder ...")
     pairs = find_pairs(cfg)
-    if not pairs:
-        raise RuntimeError("Keine geeigneten Paare. Filter oder okx_api_base pruefen.")
-    print(f"Gefundene, liquide USDT-SWAPs: {len(pairs)}")
+    print(f"{len(pairs)} geeignete Krypto-Kontrakte mit ATR-Profilen:")
     print_pairs(pairs)
-    bars = get_bars(cfg, pairs[0].symbol)
-    if not bars:
-        raise RuntimeError("Keine bestaetigten Candles erhalten")
-    print(f"Kerzen-Test OK: {pairs[0].symbol}, letzte abgeschlossene Kerze "
-          f"{utc_time(bars[-1].ts)}, Close={pretty_price(bars[-1].c)}")
-    events = find_signals(bars, cfg["strategy"])
-    recent = events[-3:]
-    for event in recent:
-        print(f"  Historisches Testsignal: {event.kind} {utc_time(event.ts)}")
-    print("Kein Push versendet; keine Trades platziert.")
+    print("Keine Signalanalyse, keine Pushes, keine Trades.")
 
 
 def loop(cfg: dict, once: bool, dashboard: Dashboard | None = None) -> None:
-    state = read_state()
-    pairs: list[Pair] = []
-    next_refresh = 0.0
-    poll = float(cfg["runtime"]["poll_seconds"])
-    summary_seconds = float(cfg.get("notifications", {}).get("summary_seconds", 120))
-    next_summary = time.monotonic() + summary_seconds
-    print("OKX-SMC-Scanner aktiv. Abbrechen: Strg+C")
-    print("Erster Durchlauf setzt Startmarken (keine alten Pushes).")
+    history = RankingHistory()
+    refresh = float(cfg["runtime"]["refresh_pairs_minutes"]) * 60
+    if dashboard:
+        dashboard.update(refresh_seconds=refresh, signals_enabled=False)
+    print("OKX Futures-Finder aktiv. Abbrechen: Strg+C")
     while True:
-        cycle_start = time.monotonic()
+        started = time.monotonic()
         try:
-            if not pairs or time.monotonic() >= next_refresh:
-                pairs = find_pairs(cfg, dashboard)
-                if not pairs:
-                    raise RuntimeError("Keine Paare nach Liquiditaets-/Spreadfilter")
-                next_refresh = cycle_start + 60 * float(cfg["runtime"]["refresh_pairs_minutes"])
-                # Evict histories for coins no longer watched to bound memory use.
-                active = {pair.symbol for pair in pairs}
-                for key in list(CANDLE_CACHE):
-                    if key[1] not in active:
-                        del CANDLE_CACHE[key]
-                print(f"Watchlist aktualisiert: {len(pairs)} Paare (Top: "
-                      + ", ".join(p.symbol.split('-')[0] for p in pairs[:6]) + ")")
-                print_pairs(pairs)
-                if dashboard:
-                    dashboard.update(pairs=[{"symbol": p.symbol, "turnover": p.turnover_usdt,
-                                             "turnover_5m": p.turnover_5m_usdt,
-                                             "spread": p.spread_pct, "url": chart_link(p.symbol)} for p in pairs])
-            good = errcount = 0
-            successful = 0
-            # Fetch concurrently; signal/state/file mutations stay in the main thread.
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(get_bars, cfg, pair.symbol): pair for pair in pairs}
-                for future in as_completed(futures):
-                    pair = futures[future]
-                    try:
-                        bars = future.result()
-                        pushed, failed = process_symbol(cfg, pair, state, batch=summary_seconds > 0, bars=bars)
-                        successful += 1
-                        good += pushed
-                        errcount += failed
-                        if dashboard:
-                            dashboard.update(last_success=time.time())
-                    except (RuntimeError, ValueError, KeyError, TypeError) as err:
-                        errcount += 1
-                        print(f"  API-FEHLER {pair.symbol}: {err}", file=sys.stderr)
-                        if dashboard:
-                            dashboard.update(last_error=f"{pair.symbol}: {err}")
-            save_state(state)
-            if state.get("pending") and (once or time.monotonic() >= next_summary):
-                try:
-                    flush_summary(cfg, state)
-                    next_summary = time.monotonic() + summary_seconds
-                except Exception as err:
-                    errcount += 1
-                    print(f"Zusammenfassung fehlgeschlagen: {err}", file=sys.stderr)
-                    if dashboard:
-                        dashboard.update(last_error=f"Pushover: {err}")
             if dashboard:
-                dashboard.update(last_scan=time.time(), errors=errcount,
-                                 pending=len(state.get("pending", [])),
-                                 network_requests=NETWORK_STATS["requests"],
-                                 network_bytes=NETWORK_STATS["bytes"],
-                                 cycle_seconds=round(time.monotonic() - cycle_start, 1))
-                if successful:
-                    dashboard.update(last_success=time.time())
-            print(f"{datetime.now().strftime('%H:%M:%S')} | "
-                  f"{len(pairs)} Coins geprueft | {good} Push(es) | {errcount} Fehler")
-        except Exception as err:
-            print(f"Zyklus-Fehler: {err}", file=sys.stderr)
+                dashboard.update(phase="ATR und kurzfristige Aktivitaet werden gemessen", processed=0, total=0)
+            pairs = find_pairs(cfg, dashboard)
+            print_pairs(pairs)
             if dashboard:
-                dashboard.update(last_error=str(err), errors=1)
+                dashboard.update(pairs=history.decorate(pairs),
+                                 last_scan=time.time(), errors=0,
+                                 phase="Wartet auf naechste Messung")
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError) as err:
+            print(f"DATEN-FEHLER: {err}", file=sys.stderr)
+            if dashboard:
+                dashboard.report_error("Marktdaten", str(err))
+                dashboard.update(errors=1, phase="Datenfehler - naechster Versuch folgt")
+        if dashboard:
+            dashboard.update(network_requests=NETWORK_STATS["requests"],
+                             network_bytes=NETWORK_STATS["bytes"],
+                             cycle_seconds=round(time.monotonic()-started, 1))
         if once:
-            break
-        try:
-            wait = min(poll - (time.monotonic() - cycle_start), next_refresh - time.monotonic())
-            time.sleep(max(2.0, wait))
-        except KeyboardInterrupt:
-            break
+            return
+        time.sleep(max(2, refresh-(time.monotonic()-started)))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OKX Sweep/BOS Scanner mit Pushover")
+    parser = argparse.ArgumentParser(description="OKX Futures-Finder: ATR fuer 1m- und 5m-Charts")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check", action="store_true", help="OKX API und Filter testen, ohne Push")
-    mode.add_argument("--test-push", action="store_true", help="Pushover-Testnachricht senden")
-    mode.add_argument("--once", action="store_true", help="Einen kompletten Scanner-Durchlauf starten")
+    mode.add_argument("--check", action="store_true", help="Oeffentliche Daten pruefen und Rangliste ausgeben")
+    mode.add_argument("--once", action="store_true", help="Eine Messung ausfuehren")
+    parser.add_argument("--market-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         cfg = read_config()
         if args.check:
             print_health_check(cfg)
-        elif args.test_push:
-            push_notification(cfg, "OKX Scanner: Push-Test",
-                              "Deine Verbindung funktioniert. Zukuenftige Sweep/BOS-Signale kommen hier an.")
-            print("Pushover-Test erfolgreich gesendet.")
-        else:
-            dashboard = Dashboard(ROOT, int(cfg["dashboard"].get("port", 8765)))
-            stop = threading.Event()
-            if cfg["dashboard"].get("enabled", True):
-                dashboard.start()
-            monitor = HealthMonitor(dashboard, cfg["notifications"].get("outage_seconds", 180),
-                                    lambda title, message: push_notification(cfg, title, message))
-            thread = threading.Thread(target=monitor.run, args=(stop,), daemon=True)
-            if not args.once:
-                thread.start()
-            try:
-                loop(cfg, args.once, dashboard)
-            finally:
-                stop.set()
-                if thread.is_alive():
-                    thread.join(timeout=15)
-                dashboard.close()
+            return 0
+        dashboard = Dashboard(ROOT, int(cfg["dashboard"].get("port", 8765)), cfg['dashboard']['host'])
+        if cfg["dashboard"].get("enabled", True):
+            dashboard.start()
+        try:
+            loop(cfg, args.once, dashboard)
+        finally:
+            dashboard.close()
         return 0
-    except (RuntimeError, ValueError, KeyError, OSError, json.JSONDecodeError) as err:
+    except KeyboardInterrupt:
+        print("Futures-Finder gestoppt.")
+        return 0
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError) as err:
         print(f"FEHLER: {err}", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        print("\nScanner gestoppt.")
-        return 0
 
 
 if __name__ == "__main__":

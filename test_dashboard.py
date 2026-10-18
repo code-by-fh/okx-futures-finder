@@ -16,12 +16,22 @@ class DashboardTests(unittest.TestCase):
         dashboard.start()
         try:
             base = f"http://127.0.0.1:{dashboard.server.server_port}"
+            with urlopen(base + '/healthz') as response:
+                self.assertEqual(json.load(response), {'status': 'ok'})
             with urlopen(base + "/api/status") as response:
                 data = json.load(response)
             self.assertIn("pairs", data)
             self.assertNotIn("pushover", data)
             with urlopen(base) as response:
-                self.assertIn(b"Umsatz letzte 5 Min. (USDT)", response.read())
+                self.assertIn(b"ATR(14)", response.read())
+            for asset,content_type in [('/dashboard.css','text/css'),('/dashboard.js','text/javascript')]:
+                with urlopen(base+asset) as response:
+                    self.assertIn(content_type,response.headers['Content-Type'])
+            from urllib.error import HTTPError
+            for private in ('/config.json','/state.json','/../scanner.py'):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(base+private)
+                self.assertEqual(error.exception.code,404)
         finally:
             dashboard.close()
 
@@ -68,6 +78,14 @@ class DashboardTests(unittest.TestCase):
                 self.assertLess(len(state['pending']), 15)
                 self.assertEqual(json.loads(path.read_text())['pending'], state['pending'])
                 self.assertLessEqual(len(push.call_args_list[0].args[2].encode('utf-8')), 900)
+
+    def test_finder_does_not_load_historical_signals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            (root/'signals.csv').write_text('time_utc,symbol,event,close\nnow,BTC,BULL_SWEEP,100\nold,ETH,BEAR_BOS,50\n',encoding='utf-8')
+            dashboard=Dashboard(root)
+            dashboard.update(pending_signals=[dict(symbol='BTC',kind='BULL_SWEEP',time='now')])
+            self.assertNotIn('signals',dashboard.snapshot())
 
 
 if __name__ == '__main__':
