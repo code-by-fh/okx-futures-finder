@@ -526,6 +526,7 @@ def loop(cfg: dict, once: bool, dashboard: Dashboard | None = None) -> None:
     print("OKX Futures-Finder aktiv. Abbrechen: Strg+C")
     while True:
         started = time.monotonic()
+        print(f"[{utc_time(int(time.time()*1000))}] Messung gestartet.", flush=True)
         try:
             if dashboard:
                 dashboard.update(phase="ATR und kurzfristige Aktivitaet werden gemessen", processed=0, total=0)
@@ -545,8 +546,12 @@ def loop(cfg: dict, once: bool, dashboard: Dashboard | None = None) -> None:
                              network_bytes=NETWORK_STATS["bytes"],
                              cycle_seconds=round(time.monotonic()-started, 1))
         if once:
+            print("Einmalige Messung beendet (--once).", flush=True)
             return
-        time.sleep(max(2, refresh-(time.monotonic()-started)))
+        wait_seconds = max(2, refresh-(time.monotonic()-started))
+        print(f"Messung abgeschlossen. Naechste Messung in {wait_seconds:.0f} Sekunden; "
+              "Finder und UI laufen weiter.", flush=True)
+        time.sleep(wait_seconds)
 
 
 def main() -> int:

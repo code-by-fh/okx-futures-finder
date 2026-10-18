@@ -69,6 +69,17 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(dashboard.data['pairs'][0]['turnover_5m'],100)
         self.assertFalse(dashboard.data['signals_enabled'])
 
+    def test_continuous_mode_runs_again_after_printing_pairs(self):
+        cfg = dict(runtime=dict(refresh_pairs_minutes=1))
+        dashboard = Dashboard(Path('.'))
+        with patch('scanner.find_pairs', return_value=[]) as discover, \
+                patch('scanner.print_pairs'), \
+                patch('scanner.time.sleep', side_effect=[None, KeyboardInterrupt]):
+            with self.assertRaises(KeyboardInterrupt):
+                loop(cfg, once=False, dashboard=dashboard)
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(dashboard.snapshot()['phase'], 'Wartet auf naechste Messung')
+
     def test_errors_are_bounded_and_timestamped(self):
         dashboard=Dashboard(Path('.'))
         for i in range(60):dashboard.report_error('Test',str(i),'BTC')
